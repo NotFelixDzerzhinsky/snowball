@@ -5,6 +5,108 @@
 #include <string.h> /* for strlen */
 #include "header.h"
 
+enum runtime_fast_path {
+    RUNTIME_FAST_NONE = 0,
+    RUNTIME_FAST_GROUPING = 1,
+    RUNTIME_FAST_SKIP = 2,
+    RUNTIME_FAST_ASSUME_ASCII = 4,
+    RUNTIME_FAST_FIXED2_UTF8 = 8,
+    RUNTIME_FAST_FIXED3_UTF8 = 16
+};
+
+static bool get_optimized_generation(void) {
+    const char * value = getenv("SNOWBALL_OPTIMIZE_GENERATED");
+    if (value == NULL || strcmp(value, "0") == 0) return false;
+    if (strcmp(value, "1") == 0) return true;
+    fprintf(stderr, "unknown SNOWBALL_OPTIMIZE_GENERATED value: %s\n", value);
+    exit(1);
+}
+static int get_runtime_fast_path(void) {
+    const char * value = getenv("SNOWBALL_RUNTIME_FAST_PATH");
+    if (value == NULL) {
+        return get_optimized_generation()
+                   ? RUNTIME_FAST_GROUPING | RUNTIME_FAST_SKIP
+                   : RUNTIME_FAST_NONE;
+    }
+    if (strcmp(value, "none") == 0) return RUNTIME_FAST_NONE;
+    if (strcmp(value, "grouping") == 0) return RUNTIME_FAST_GROUPING;
+    if (strcmp(value, "skip") == 0) return RUNTIME_FAST_SKIP;
+    if (strcmp(value, "combined") == 0)
+        return RUNTIME_FAST_GROUPING | RUNTIME_FAST_SKIP;
+    if (strcmp(value, "ascii") == 0)
+        return RUNTIME_FAST_GROUPING | RUNTIME_FAST_SKIP |
+               RUNTIME_FAST_ASSUME_ASCII;
+    if (strcmp(value, "fixed2") == 0)
+        return RUNTIME_FAST_GROUPING | RUNTIME_FAST_SKIP |
+               RUNTIME_FAST_FIXED2_UTF8;
+    if (strcmp(value, "fixed3") == 0)
+        return RUNTIME_FAST_GROUPING | RUNTIME_FAST_SKIP |
+               RUNTIME_FAST_FIXED3_UTF8;
+    fprintf(stderr, "unknown SNOWBALL_RUNTIME_FAST_PATH value: %s\n", value);
+    exit(1);
+}
+
+static bool get_fast_suffix_delete(void) {
+    const char * value = getenv("SNOWBALL_FAST_SUFFIX_DELETE");
+    if (value == NULL) return get_optimized_generation();
+    if (strcmp(value, "0") == 0) return false;
+    if (strcmp(value, "1") == 0) return true;
+    fprintf(stderr, "unknown SNOWBALL_FAST_SUFFIX_DELETE value: %s\n", value);
+    exit(1);
+}
+
+static bool get_inline_short_literals(void) {
+    const char * value = getenv("SNOWBALL_INLINE_SHORT_LITERALS");
+    if (value == NULL) return get_optimized_generation();
+    if (strcmp(value, "0") == 0) return false;
+    if (strcmp(value, "1") == 0) return true;
+    fprintf(stderr, "unknown SNOWBALL_INLINE_SHORT_LITERALS value: %s\n", value);
+    exit(1);
+}
+
+static bool get_inline_two_byte_utf8(void) {
+    const char * value = getenv("SNOWBALL_INLINE_TWO_BYTE_UTF8");
+    if (value == NULL) return get_optimized_generation();
+    if (strcmp(value, "0") == 0) return false;
+    if (strcmp(value, "1") == 0) return true;
+    fprintf(stderr, "unknown SNOWBALL_INLINE_TWO_BYTE_UTF8 value: %s\n", value);
+    exit(1);
+}
+
+static bool get_fast_single_skip(void) {
+    const char * value = getenv("SNOWBALL_FAST_SINGLE_SKIP");
+    if (value == NULL) return get_optimized_generation();
+    if (strcmp(value, "0") == 0) return false;
+    if (strcmp(value, "1") == 0) return true;
+    fprintf(stderr, "unknown SNOWBALL_FAST_SINGLE_SKIP value: %s\n", value);
+    exit(1);
+}
+
+static bool get_fast_input_copy(void) {
+    const char * value = getenv("SNOWBALL_FAST_INPUT_COPY");
+    if (value == NULL) return get_optimized_generation();
+    if (strcmp(value, "0") == 0) return false;
+    if (strcmp(value, "1") == 0) return true;
+    fprintf(stderr, "unknown SNOWBALL_FAST_INPUT_COPY value: %s\n", value);
+    exit(1);
+}
+
+static bool get_art_node4_linear(void) {
+    const char * value = getenv("SNOWBALL_ART_NODE4");
+    if (value == NULL || strcmp(value, "linear") == 0) return true;
+    if (strcmp(value, "switch") == 0) return false;
+    fprintf(stderr, "unknown SNOWBALL_ART_NODE4 value: %s\n", value);
+    exit(1);
+}
+
+static bool get_art_node16_simd(void) {
+    const char * value = getenv("SNOWBALL_ART_NODE16");
+    if (value == NULL || strcmp(value, "simd") == 0) return true;
+    if (strcmp(value, "switch") == 0) return false;
+    fprintf(stderr, "unknown SNOWBALL_ART_NODE16 value: %s\n", value);
+    exit(1);
+}
+
 // C90 guarantees 31 significant initial characters in an internal identifier.
 #define C_MAX_ID_LEN 31
 
@@ -22,6 +124,7 @@
 static void generate(struct generator * g, struct node * p);
 static void w(struct generator * g, const char * s);
 static void writef(struct generator * g, const char * s, struct node * p);
+static bool c_direct_among_may_need_var(const struct generator * g);
 
 static bool can_error_(struct node * p);
 
@@ -187,7 +290,7 @@ static void wlitref(struct generator * g, const symbol * p) {  /* write ref to l
     //
     // Currently we use a naive algorithm which scans all the literals
     // we've allocated so far for each new literal string.  This will be
-    // O(n²) but for real world Snowball stemmers n is a few hundred at
+    // O(nВІ) but for real world Snowball stemmers n is a few hundred at
     // most so this is plenty fast enough in practice.
     struct c_literalstring * s = g->c_literalstrings;
     struct c_literalstring ** append_to = &(g->c_literalstrings);
@@ -225,6 +328,22 @@ static void write_c_string_literal(struct generator * g, const symbol * s) {
             if (ch == '\"' || ch == '\\') {
                 write_char(g, '\\');
             }
+            write_char(g, ch);
+        } else {
+            write_char(g, '\\');
+            write_octal3(g, ch);
+        }
+    }
+}
+
+static void write_c_string_literal_range(struct generator * g,
+                                         const symbol * s,
+                                         int begin,
+                                         int end) {
+    for (int i = begin; i != end; ++i) {
+        symbol ch = s[i];
+        if (32 <= ch && ch < 127) {
+            if (ch == '"' || ch == '\\') write_char(g, '\\');
             write_char(g, ch);
         } else {
             write_char(g, '\\');
@@ -783,10 +902,30 @@ static void generate_do(struct generator * g, struct node * p) {
 static void generate_next(struct generator * g, struct node * p) {
     write_comment(g, p);
     if (g->options->encoding == ENC_UTF8) {
-        if (p->mode == m_forward)
-            w(g, "~{~Mint ret = skip_utf8(z->p, z->c, z->l, 1");
-        else
-            w(g, "~{~Mint ret = skip_b_utf8(z->p, z->c, z->lb, 1");
+        bool assume_ascii = (get_runtime_fast_path() &
+                             RUNTIME_FAST_ASSUME_ASCII) != 0;
+        if ((g->options->target_lang == LANG_CPLUSPLUS ||
+             g->options->target_lang == LANG_C) && assume_ascii) {
+            write_margin(g);
+            write_check_limit(g, p);
+            write_newline(g);
+            write_margin(g);
+            winc(g, p);
+            write_newline(g);
+            return;
+        }
+        bool fast_skip = (g->options->target_lang == LANG_CPLUSPLUS ||
+                          g->options->target_lang == LANG_C) &&
+                         (get_runtime_fast_path() & RUNTIME_FAST_SKIP);
+        if (p->mode == m_forward) {
+            w(g, fast_skip
+                     ? "~{~Mint ret = snowball_skip_utf8(z->p, z->c, z->l, 1"
+                     : "~{~Mint ret = skip_utf8(z->p, z->c, z->l, 1");
+        } else {
+            w(g, fast_skip
+                     ? "~{~Mint ret = snowball_skip_b_utf8(z->p, z->c, z->lb, 1"
+                     : "~{~Mint ret = skip_b_utf8(z->p, z->c, z->lb, 1");
+        }
         writef(g, ");~N"
               "~Mif (ret < 0) ~f~N"
               "~Mz->c = ret;~N"
@@ -808,13 +947,19 @@ static void generate_GO_grouping(struct generator * g, struct node * p, int is_g
     g->S[0] = p->mode == m_forward ? "" : "_b";
     g->S[1] = complement ? "in" : "out";
     g->S[2] = g->options->encoding == ENC_UTF8 ? "_U" : "";
+    g->S[3] = (g->options->target_lang == LANG_CPLUSPLUS ||
+                       g->options->target_lang == LANG_C) &&
+                      g->options->encoding == ENC_UTF8 &&
+                      (get_runtime_fast_path() & RUNTIME_FAST_GROUPING)
+                  ? "snowball_"
+                  : "";
     g->I[0] = q->smallest_ch;
     g->I[1] = q->largest_ch;
     if (is_goto) {
-        writef(g, "~Mif (~S1_grouping~S0~S2(z, ~V, ~I0, ~I1, 1) < 0) ~f~N", p);
+        writef(g, "~Mif (~S3~S1_grouping~S0~S2(z, ~V, ~I0, ~I1, 1) < 0) ~f~N", p);
     } else {
         writef(g, "~{"
-              "~Mint ret = ~S1_grouping~S0~S2(z, ~V, ~I0, ~I1, 1);~N"
+              "~Mint ret = ~S3~S1_grouping~S0~S2(z, ~V, ~I0, ~I1, 1);~N"
               "~Mif (ret < 0) ~f~N", p);
 
         if (p->mode == m_forward)
@@ -961,6 +1106,32 @@ static void generate_tomark(struct generator * g, struct node * p) {
 static void generate_hop(struct generator * g, struct node * p) {
     write_comment(g, p);
     if (g->options->encoding == ENC_UTF8) {
+        bool assume_ascii = (g->options->target_lang == LANG_CPLUSPLUS ||
+                             g->options->target_lang == LANG_C) &&
+                            (get_runtime_fast_path() &
+                             RUNTIME_FAST_ASSUME_ASCII);
+        if (assume_ascii) {
+            g->S[0] = p->mode == m_forward ? "+" : "-";
+            g->S[1] = p->mode == m_forward ? "z->l" : "z->lb";
+            w(g, "~{");
+            if (p->AE->type == c_number) {
+                g->I[0] = p->AE->number;
+                w(g, "~Mif (z->c ~S0 ~I0 ");
+                w(g, p->mode == m_forward ? "> " : "< ");
+                writef(g, "~S1) ~f~N", p);
+                w(g, "~Mz->c ~S0= ~I0;~N");
+            } else {
+                w(g, "~Mint ae = ");
+                generate_AE(g, p->AE);
+                w(g, ";~N~Mint ret = z->c ~S0 ae;~N");
+                w(g, "~Mif (ae < 0 || ret ");
+                w(g, p->mode == m_forward ? "> " : "< ");
+                writef(g, "~S1) ~f~N", p);
+                w(g, "~Mz->c = ret;~N");
+            }
+            w(g, "~}");
+            return;
+        }
         g->S[0] = p->mode == m_forward ? "" : "_b";
         g->S[1] = p->mode == m_forward ? "z->l" : "z->lb";
         w(g, "~{");
@@ -970,7 +1141,13 @@ static void generate_hop(struct generator * g, struct node * p) {
             // No need to check for negative hop as that's converted to false by
             // the analyser.
             g->I[0] = p->AE->number;
-            w(g, "~Mint ret = skip~S0_utf8(z->p, z->c, ~S1, ~I0);~N");
+            if ((g->options->target_lang == LANG_CPLUSPLUS ||
+                 g->options->target_lang == LANG_C) &&
+                (get_runtime_fast_path() & RUNTIME_FAST_SKIP)) {
+                w(g, "~Mint ret = snowball_skip~S0_utf8(z->p, z->c, ~S1, ~I0);~N");
+            } else {
+                w(g, "~Mint ret = skip~S0_utf8(z->p, z->c, ~S1, ~I0);~N");
+            }
         } else {
             w(g, "~Mint ae = ");
             generate_AE(g, p->AE);
@@ -1058,7 +1235,13 @@ static void generate_stringassign(struct generator * g, struct node * p) {
 static void generate_slicefrom(struct generator * g, struct node * p) {
     write_comment(g, p);
     if (p->literalstring && SIZE(p->literalstring) == 0) {
-        write_propagating_error(g, "slice_del(z)", false, p);
+        if ((g->options->target_lang == LANG_CPLUSPLUS ||
+             g->options->target_lang == LANG_C) &&
+            get_fast_suffix_delete()) {
+            write_propagating_error(g, "snowball_slice_del(z)", false, p);
+        } else {
+            write_propagating_error(g, "slice_del(z)", false, p);
+        }
         return;
     }
     write_propagating_error(g, "slice_from_~$(z, ~a)", false, p);
@@ -1293,13 +1476,19 @@ static void generate_grouping(struct generator * g, struct node * p, int complem
     g->S[0] = p->mode == m_forward ? "" : "_b";
     g->S[1] = complement ? "out" : "in";
     g->S[2] = g->options->encoding == ENC_UTF8 ? "_U" : "";
+    g->S[3] = (g->options->target_lang == LANG_CPLUSPLUS ||
+                       g->options->target_lang == LANG_C) &&
+                      g->options->encoding == ENC_UTF8 &&
+                      (get_runtime_fast_path() & RUNTIME_FAST_GROUPING)
+                  ? "snowball_"
+                  : "";
     g->I[0] = q->smallest_ch;
     g->I[1] = q->largest_ch;
     if (tailcallable(g, p)) {
-        writef(g, "~Mreturn !~S1_grouping~S0~S2(z, ~V, ~I0, ~I1, 0);~N", p);
+        writef(g, "~Mreturn !~S3~S1_grouping~S0~S2(z, ~V, ~I0, ~I1, 0);~N", p);
         p->right = NULL;
     } else {
-        writef(g, "~Mif (~S1_grouping~S0~S2(z, ~V, ~I0, ~I1, 0)) ~f~N", p);
+        writef(g, "~Mif (~S3~S1_grouping~S0~S2(z, ~V, ~I0, ~I1, 0)) ~f~N", p);
     }
 }
 
@@ -1338,6 +1527,31 @@ static void generate_literalstring(struct generator * g, struct node * p) {
         return;
     }
 
+    /* eq_s()/eq_s_b() live in a separate translation unit and receive the
+     * literal length as a runtime value.  As a result, tiny UTF-8 literals
+     * (most notably two-byte Cyrillic letters) still call libc memcmp.  Keep
+     * the size visible at the generated call site so the compiler can lower
+     * the comparison to a load or a couple of byte comparisons. */
+    if ((g->options->target_lang == LANG_CPLUSPLUS ||
+         g->options->target_lang == LANG_C) &&
+        get_inline_short_literals() && SIZE(b) <= 4) {
+        g->I[0] = SIZE(b);
+        if (p->mode == m_forward) {
+            writef(g,
+                   "~Mif (z->l - z->c < ~I0 || "
+                   "__builtin_memcmp(z->p + z->c, ~L, ~I0) != 0) ~f~N"
+                   "~Mz->c += ~I0;~N",
+                   p);
+        } else {
+            writef(g,
+                   "~Mif (z->c - z->lb < ~I0 || "
+                   "__builtin_memcmp(z->p + z->c - ~I0, ~L, ~I0) != 0) ~f~N"
+                   "~Mz->c -= ~I0;~N",
+                   p);
+        }
+        return;
+    }
+
     g->S[0] = p->mode == m_forward ? "" : "_b";
     if (tailcallable(g, p)) {
         writef(g, "~Mreturn eq_s~S0(z, ~s, ~L);~N", p);
@@ -1362,7 +1576,9 @@ static void generate_define(struct generator * g, struct node * p) {
 
     // The among implementation we use for C requires among_var for any
     // among with functions.
-    if ((g->options->coverage ? q->has_among : q->has_among_function) ||
+    if (((g->options->target_lang == LANG_CPLUSPLUS ||
+          c_direct_among_may_need_var(g)) && q->has_among) ||
+        (g->options->coverage ? q->has_among : q->has_among_function) ||
         amongvar_needed(p->left)) {
         w(g, "~Mint among_var;~N");
     }
@@ -1453,17 +1669,1322 @@ static void generate_functionend(struct generator * g, struct node * p) {
     w(g, "~Mreturn 1;~N");
 }
 
-static int among_mode(struct among * x) {
+static int among_mode(const struct among * x) {
     return (x->substring ? x->substring : x->node)->mode;
+}
+
+/* Emit a byte switch followed by constant-size comparisons.  This keeps the
+ * dispatch visible to the optimiser without fully unrolling the trie (which
+ * is quick but causes excessive text growth).  __builtin_memcmp with a known
+ * size is lowered to a handful of unaligned loads for the short affixes used
+ * by Snowball.
+ */
+enum direct_among_backend {
+    DIRECT_AMONG_DEFAULT,
+    DIRECT_AMONG_RUNTIME,
+    DIRECT_AMONG_AUTO,
+    DIRECT_AMONG_MEMCMP,
+    DIRECT_AMONG_TWOBYTE,
+    DIRECT_AMONG_TWOBYTE_PACKED,
+    DIRECT_AMONG_HYBRID,
+    DIRECT_AMONG_TRIE,
+    DIRECT_AMONG_ART,
+    DIRECT_AMONG_RADIX,
+    DIRECT_AMONG_RADIX_BUDGET,
+    DIRECT_AMONG_SHARED_PREFIX,
+    DIRECT_AMONG_PACKED
+};
+
+static enum direct_among_backend get_direct_among_backend(void) {
+    const char * value = getenv("SNOWBALL_AMONG_BACKEND");
+    if (value == NULL)
+        return get_optimized_generation() ? DIRECT_AMONG_AUTO
+                                          : DIRECT_AMONG_DEFAULT;
+    if (strcmp(value, "memcmp") == 0)
+        return DIRECT_AMONG_MEMCMP;
+    if (strcmp(value, "twobyte") == 0)
+        return DIRECT_AMONG_TWOBYTE;
+    if (strcmp(value, "twobyte_packed") == 0)
+        return DIRECT_AMONG_TWOBYTE_PACKED;
+    if (strcmp(value, "hybrid") == 0)
+        return DIRECT_AMONG_HYBRID;
+    if (strcmp(value, "auto") == 0) return DIRECT_AMONG_AUTO;
+    if (strcmp(value, "runtime") == 0) return DIRECT_AMONG_RUNTIME;
+    if (strcmp(value, "trie") == 0) return DIRECT_AMONG_TRIE;
+    if (strcmp(value, "art") == 0)
+        return DIRECT_AMONG_ART;
+    if (strcmp(value, "radix") == 0)
+        return DIRECT_AMONG_RADIX;
+    if (strcmp(value, "radix_budget") == 0)
+        return DIRECT_AMONG_RADIX_BUDGET;
+    if (strcmp(value, "shared_prefix") == 0)
+        return DIRECT_AMONG_SHARED_PREFIX;
+    if (strcmp(value, "packed") == 0) return DIRECT_AMONG_PACKED;
+    fprintf(stderr, "unknown SNOWBALL_AMONG_BACKEND value: %s\n", value);
+    exit(1);
+}
+
+/* Predicate-bearing among tables are the case where the compact runtime
+ * matcher is most expensive: after finding a literal it may need to walk the
+ * substring fallback chain and invoke one or more generated predicates.
+ * A small table is better left compact, while a large one benefits from
+ * direct byte dispatch.  Keep this decision about the table, not the language,
+ * so new algorithms get the same treatment without a name allow-list. */
+#define AUTO_TRIE_MIN_CASES 32
+
+static bool radix_table_within_budget(const struct among * x);
+
+static bool among_is_fixed_three_byte_utf8(const struct among * x) {
+    for (int i = 0; i < x->literalstring_count; ++i) {
+        const struct amongvec * candidate = x->v + i;
+        if (candidate->size == 0) continue;
+        if (candidate->size % 3 != 0) return false;
+        for (int offset = 0; offset < candidate->size; offset += 3) {
+            if (candidate->b[offset] < 0xE0 ||
+                candidate->b[offset] > 0xEF ||
+                (candidate->b[offset + 1] & 0xC0) != 0x80 ||
+                (candidate->b[offset + 2] & 0xC0) != 0x80) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static enum direct_among_backend select_direct_among_backend(
+    const struct generator * g, const struct among * x) {
+    const char * report_shapes = getenv("SNOWBALL_REPORT_AMONG_SHAPES");
+    if (report_shapes != NULL && strcmp(report_shapes, "1") == 0) {
+        fprintf(stderr, "among cases=%d longest=%d functions=%d mode=%s\n",
+                x->literalstring_count, x->longest_size, x->function_count,
+                among_mode(x) == m_forward ? "forward" : "backward");
+    }
+    enum direct_among_backend backend = get_direct_among_backend();
+    if (backend == DIRECT_AMONG_DEFAULT) {
+        return g->options->target_lang == LANG_CPLUSPLUS
+                   ? DIRECT_AMONG_MEMCMP
+                   : DIRECT_AMONG_RUNTIME;
+    }
+    if (backend == DIRECT_AMONG_RADIX_BUDGET) {
+        if (radix_table_within_budget(x)) return DIRECT_AMONG_RADIX;
+        return x->function_count == 0 ? DIRECT_AMONG_MEMCMP
+                                      : DIRECT_AMONG_RUNTIME;
+    }
+    if (backend != DIRECT_AMONG_AUTO) return backend;
+
+    /* Select one layout for the whole generated algorithm.  Mixing compact
+     * and direct tables keeps more matcher machinery hot and gave worse
+     * results for Polish.  The decision is still data-driven: the presence of
+     * one large predicate table marks an algorithm as trie-heavy. */
+    for (const struct among * candidate = g->analyser->amongs;
+         candidate != NULL; candidate = candidate->next) {
+        if (candidate->function_count != 0 &&
+            candidate->literalstring_count >= AUTO_TRIE_MIN_CASES) {
+            return DIRECT_AMONG_TRIE;
+        }
+    }
+
+    /* Large fixed-width three-byte suffix tables have deep byte prefixes and
+     * enough medium-fanout nodes for ART path compression plus Node4/Node16
+     * dispatch to pay off.  This describes the Nepali table structurally and
+     * deliberately avoids a language allow-list. */
+    for (const struct among * candidate = g->analyser->amongs;
+         candidate != NULL; candidate = candidate->next) {
+        if (candidate->function_count == 0 &&
+            candidate->literalstring_count >= 64 &&
+            candidate->longest_size >= 12 &&
+            among_is_fixed_three_byte_utf8(candidate)) {
+            return DIRECT_AMONG_ART;
+        }
+    }
+
+    /* Direct constant-size comparisons are the default optimized layout for
+     * ordinary C and C++ tables. */
+    return DIRECT_AMONG_MEMCMP;
+}
+
+static bool direct_among_backend_is_used(const struct generator * g,
+                                         enum direct_among_backend backend) {
+    for (const struct among * candidate = g->analyser->amongs;
+         candidate != NULL; candidate = candidate->next) {
+        if (select_direct_among_backend(g, candidate) == backend) return true;
+    }
+    return false;
+}
+
+static bool c_direct_among_may_need_var(const struct generator * g) {
+    if (g->options->target_lang != LANG_C) return false;
+
+    enum direct_among_backend backend = get_direct_among_backend();
+    if (backend == DIRECT_AMONG_DEFAULT ||
+        backend == DIRECT_AMONG_RUNTIME ||
+        backend == DIRECT_AMONG_PACKED) {
+        return false;
+    }
+    if (backend == DIRECT_AMONG_MEMCMP ||
+        backend == DIRECT_AMONG_TWOBYTE ||
+        backend == DIRECT_AMONG_TWOBYTE_PACKED ||
+        backend == DIRECT_AMONG_HYBRID ||
+        backend == DIRECT_AMONG_TRIE ||
+        backend == DIRECT_AMONG_ART ||
+        backend == DIRECT_AMONG_RADIX ||
+        backend == DIRECT_AMONG_RADIX_BUDGET ||
+        backend == DIRECT_AMONG_SHARED_PREFIX) {
+        return true;
+    }
+
+    assert(backend == DIRECT_AMONG_AUTO);
+    return true;
+}
+
+static int * collect_direct_among_cases(struct among * x,
+                                        int * case_count,
+                                        int * empty_case) {
+    int * cases = malloc((size_t)x->literalstring_count * sizeof(*cases));
+    if (cases == NULL) {
+        fprintf(stderr, "out of memory generating direct among\n");
+        exit(1);
+    }
+    *case_count = 0;
+    *empty_case = -1;
+    for (int i = 0; i < x->literalstring_count; ++i) {
+        if (x->v[i].size == 0) {
+            assert(*empty_case == -1);
+            *empty_case = i;
+        } else {
+            cases[(*case_count)++] = i;
+        }
+    }
+    return cases;
+}
+
+static void sort_direct_among_cases(struct among * x,
+                                    int * cases,
+                                    int case_count) {
+    /* Longest match wins.  Sorting once in the generator makes each emitted
+     * switch arm a straight sequence of increasingly cheap fallbacks. */
+    for (int i = 1; i < case_count; ++i) {
+        int value = cases[i];
+        int j = i;
+        while (j > 0 && x->v[cases[j - 1]].size < x->v[value].size) {
+            cases[j] = cases[j - 1];
+            --j;
+        }
+        cases[j] = value;
+    }
+}
+
+static void generate_direct_among_prefix(struct generator * g,
+                                         int empty_result,
+                                         bool backwards) {
+    w(g, "~M{~N~+");
+    w(g, "~Mint c_among = z->c;~N");
+    w(g, "~Mamong_var = ");
+    write_int(g, empty_result);
+    w(g, ";~N");
+    w(g, "~Mif (c_among ");
+    w(g, backwards ? "> z->lb" : "< z->l");
+    w(g, ") {~N~+");
+    w(g, "~Mswitch (z->p[c_among");
+    w(g, backwards ? " - 1" : "");
+    w(g, "]) {~N~+");
+}
+
+static void generate_direct_among_suffix(struct generator * g) {
+    w(g, "~-~M}~N");
+    w(g, "~-~M}~N");
+    w(g, "~-~M}~N");
+}
+
+static void generate_packed_comparisons(struct generator * g,
+                                        const struct amongvec * candidate,
+                                        bool backwards);
+
+static void generate_memcmp_among(struct generator * g,
+                                  struct among * x,
+                                  bool backwards,
+                                  bool selective_packed) {
+    int case_count;
+    int empty_case;
+    int * cases = collect_direct_among_cases(x, &case_count, &empty_case);
+    sort_direct_among_cases(x, cases, case_count);
+
+    generate_direct_among_prefix(
+        g, empty_case == -1 ? 0 : x->v[empty_case].result, backwards);
+
+    bool seen[256] = { false };
+    for (int i = 0; i < case_count; ++i) {
+        const struct amongvec * e = x->v + cases[i];
+        int edge_pos = backwards ? e->size - 1 : 0;
+        unsigned edge = e->b[edge_pos];
+        assert(edge < 256);
+        if (seen[edge]) continue;
+        seen[edge] = true;
+
+        int edge_cases = 0;
+        for (int j = 0; j < case_count; ++j) {
+            const struct amongvec * candidate = x->v + cases[j];
+            int candidate_edge_pos = backwards ? candidate->size - 1 : 0;
+            if (candidate->b[candidate_edge_pos] == edge) ++edge_cases;
+        }
+
+        w(g, "~Mcase ");
+        wlitch(g, (int)edge);
+        w(g, ":~N~+");
+        for (int j = 0; j < case_count; ++j) {
+            const struct amongvec * candidate = x->v + cases[j];
+            int candidate_edge_pos = backwards ? candidate->size - 1 : 0;
+            if (candidate->b[candidate_edge_pos] != edge) continue;
+
+            w(g, "~Mif (c_among ");
+            w(g, backwards ? "- z->lb >= " : "+ ");
+            write_int(g, candidate->size);
+            if (!backwards) w(g, " <= z->l");
+            if (candidate->size > 1 && selective_packed &&
+                edge_cases >= 3 && candidate->size <= 9) {
+                generate_packed_comparisons(g, candidate, backwards);
+            } else if (candidate->size > 1) {
+                w(g, " && __builtin_memcmp(z->p + c_among");
+                if (backwards) {
+                    w(g, " - ");
+                    write_int(g, candidate->size);
+                } else {
+                    w(g, " + 1");
+                }
+                w(g, ", \"");
+                write_c_string_literal_range(g, candidate->b,
+                                             backwards ? 0 : 1,
+                                             backwards ? candidate->size - 1
+                                                       : candidate->size);
+                w(g, "\", ");
+                write_int(g, candidate->size - 1);
+                w(g, ") == 0");
+            }
+            w(g, ") { among_var = ");
+            write_int(g, candidate->result);
+            w(g, "; z->c = c_among ");
+            w(g, backwards ? "- " : "+ ");
+            write_int(g, candidate->size);
+            w(g, "; break; }~N");
+        }
+        w(g, "~Mbreak;~N~-");
+    }
+    generate_direct_among_suffix(g);
+    free(cases);
+}
+
+/* Dispatch on two bytes, then compare only the remaining tail.  English
+ * suffix tables have many entries sharing their final byte, so this removes
+ * a large fraction of the ordered memcmp chain without fully expanding a
+ * trie. */
+static void generate_twobyte_among(struct generator * g,
+                                   struct among * x,
+                                   bool backwards,
+                                   bool selective_packed) {
+    int case_count;
+    int empty_case;
+    int * cases = collect_direct_among_cases(x, &case_count, &empty_case);
+    sort_direct_among_cases(x, cases, case_count);
+
+    generate_direct_among_prefix(
+        g, empty_case == -1 ? 0 : x->v[empty_case].result, backwards);
+
+    bool first_seen[256] = { false };
+    for (int i = 0; i < case_count; ++i) {
+        const struct amongvec * first = x->v + cases[i];
+        int first_pos = backwards ? first->size - 1 : 0;
+        unsigned first_edge = first->b[first_pos];
+        if (first_seen[first_edge]) continue;
+        first_seen[first_edge] = true;
+
+        w(g, "~Mcase ");
+        wlitch(g, (int)first_edge);
+        w(g, ":~N~+");
+
+        for (int j = 0; j < case_count; ++j) {
+            const struct amongvec * candidate = x->v + cases[j];
+            int pos = backwards ? candidate->size - 1 : 0;
+            if (candidate->b[pos] == first_edge && candidate->size == 1) {
+                w(g, "~Mamong_var = ");
+                write_int(g, candidate->result);
+                w(g, "; z->c = c_among ");
+                w(g, backwards ? "- 1;~N" : "+ 1;~N");
+                break;
+            }
+        }
+
+        w(g, "~Mif (c_among ");
+        w(g, backwards ? "- z->lb >= 2" : "+ 2 <= z->l");
+        w(g, ") {~N~+");
+        w(g, "~Mswitch (z->p[c_among ");
+        w(g, backwards ? "- 2" : "+ 1");
+        w(g, "]) {~N~+");
+
+        bool second_seen[256] = { false };
+        for (int j = 0; j < case_count; ++j) {
+            const struct amongvec * second = x->v + cases[j];
+            if (second->size < 2) continue;
+            int first_pos2 = backwards ? second->size - 1 : 0;
+            int second_pos = backwards ? second->size - 2 : 1;
+            if (second->b[first_pos2] != first_edge) continue;
+            unsigned second_edge = second->b[second_pos];
+            if (second_seen[second_edge]) continue;
+            second_seen[second_edge] = true;
+
+            int second_cases = 0;
+            for (int k = 0; k < case_count; ++k) {
+                const struct amongvec * candidate = x->v + cases[k];
+                if (candidate->size < 2) continue;
+                int candidate_first = backwards ? candidate->size - 1 : 0;
+                int candidate_second = backwards ? candidate->size - 2 : 1;
+                if (candidate->b[candidate_first] == first_edge &&
+                    candidate->b[candidate_second] == second_edge) {
+                    ++second_cases;
+                }
+            }
+
+            w(g, "~Mcase ");
+            wlitch(g, (int)second_edge);
+            w(g, ":~N~+");
+            for (int k = 0; k < case_count; ++k) {
+                const struct amongvec * candidate = x->v + cases[k];
+                if (candidate->size < 2) continue;
+                int candidate_first = backwards ? candidate->size - 1 : 0;
+                int candidate_second = backwards ? candidate->size - 2 : 1;
+                if (candidate->b[candidate_first] != first_edge ||
+                    candidate->b[candidate_second] != second_edge) continue;
+
+                w(g, "~Mif (c_among ");
+                w(g, backwards ? "- z->lb >= " : "+ ");
+                write_int(g, candidate->size);
+                if (!backwards) w(g, " <= z->l");
+                if (candidate->size > 2 && selective_packed &&
+                    second_cases >= 3 && candidate->size <= 10) {
+                    w(g, " && snowball_packed_equal(z->p + c_among");
+                    if (backwards) {
+                        w(g, " - ");
+                        write_int(g, candidate->size);
+                    } else {
+                        w(g, " + 2");
+                    }
+                    w(g, ", \"");
+                    write_c_string_literal_range(
+                        g, candidate->b, backwards ? 0 : 2,
+                        backwards ? candidate->size - 2 : candidate->size);
+                    w(g, "\")");
+                } else if (candidate->size > 2) {
+                    w(g, " && __builtin_memcmp(z->p + c_among");
+                    if (backwards) {
+                        w(g, " - ");
+                        write_int(g, candidate->size);
+                    } else {
+                        w(g, " + 2");
+                    }
+                    w(g, ", \"");
+                    write_c_string_literal_range(
+                        g, candidate->b, backwards ? 0 : 2,
+                        backwards ? candidate->size - 2 : candidate->size);
+                    w(g, "\", ");
+                    write_int(g, candidate->size - 2);
+                    w(g, ") == 0");
+                }
+                w(g, ") { among_var = ");
+                write_int(g, candidate->result);
+                w(g, "; z->c = c_among ");
+                w(g, backwards ? "- " : "+ ");
+                write_int(g, candidate->size);
+                w(g, "; break; }~N");
+            }
+            w(g, "~Mbreak;~N~-");
+        }
+        w(g, "~-~M}~N");
+        w(g, "~-~M}~N");
+        w(g, "~Mbreak;~N~-");
+    }
+    generate_direct_among_suffix(g);
+    free(cases);
+}
+
+static void generate_packed_comparisons(struct generator * g,
+                                        const struct amongvec * candidate,
+                                        bool backwards) {
+    int begin = backwards ? 0 : 1;
+    int end = backwards ? candidate->size - 1 : candidate->size;
+    int input_offset = backwards ? -candidate->size : 1;
+    while (begin < end) {
+        int chunk = end - begin;
+        if (chunk > 8) chunk = 8;
+        w(g, " && snowball_packed_equal(z->p + c_among");
+        int offset = input_offset + (begin - (backwards ? 0 : 1));
+        if (offset > 0) {
+            w(g, " + ");
+            write_int(g, offset);
+        } else if (offset < 0) {
+            w(g, " - ");
+            write_int(g, -offset);
+        }
+        w(g, ", \"");
+        write_c_string_literal_range(g, candidate->b, begin, begin + chunk);
+        w(g, "\")");
+        begin += chunk;
+    }
+}
+
+static void generate_packed_among(struct generator * g,
+                                  struct among * x,
+                                  bool backwards) {
+    int case_count;
+    int empty_case;
+    int * cases = collect_direct_among_cases(x, &case_count, &empty_case);
+    sort_direct_among_cases(x, cases, case_count);
+
+    generate_direct_among_prefix(
+        g, empty_case == -1 ? 0 : x->v[empty_case].result, backwards);
+
+    bool seen[256] = { false };
+    for (int i = 0; i < case_count; ++i) {
+        const struct amongvec * e = x->v + cases[i];
+        int edge_pos = backwards ? e->size - 1 : 0;
+        unsigned edge = e->b[edge_pos];
+        assert(edge < 256);
+        if (seen[edge]) continue;
+        seen[edge] = true;
+
+        w(g, "~Mcase ");
+        wlitch(g, (int)edge);
+        w(g, ":~N~+");
+        for (int j = 0; j < case_count; ++j) {
+            const struct amongvec * candidate = x->v + cases[j];
+            int candidate_edge_pos = backwards ? candidate->size - 1 : 0;
+            if (candidate->b[candidate_edge_pos] != edge) continue;
+
+            w(g, "~Mif (c_among ");
+            w(g, backwards ? "- z->lb >= " : "+ ");
+            write_int(g, candidate->size);
+            if (!backwards) w(g, " <= z->l");
+            if (candidate->size > 1)
+                generate_packed_comparisons(g, candidate, backwards);
+            w(g, ") { among_var = ");
+            write_int(g, candidate->result);
+            w(g, "; z->c = c_among ");
+            w(g, backwards ? "- " : "+ ");
+            write_int(g, candidate->size);
+            w(g, "; break; }~N");
+        }
+        w(g, "~Mbreak;~N~-");
+    }
+    generate_direct_among_suffix(g);
+    free(cases);
+}
+
+/* Return the value which the compact runtime table would produce for an exact
+ * match.  For entries guarded by an among function this is an AFS code.  Its
+ * false branch points at the longest shorter match, which can itself be
+ * guarded, so resolve the fallback recursively. */
+static int direct_among_case_result(struct among * x, int index) {
+    const struct amongvec * e = x->v + index;
+    int result = e->result;
+    if (result < 0) result = AFS_FLAG - 1;
+    if (e->function == NULL) return result;
+
+    int fallback = e->i < 0 ? 0 : direct_among_case_result(x, e->i);
+    int cursor_adjustment = e->i < 0 ? -1 : x->v[e->i].size;
+    for (int i = 0; i < x->af_count; ++i) {
+        const struct among_function_scenario * scenario = x->af + i;
+        if (scenario->function == e->function &&
+            scenario->t_result == result &&
+            scenario->f_result == fallback &&
+            scenario->cursor_adjustment == cursor_adjustment) {
+            return AFS_FLAG | i;
+        }
+    }
+    fprintf(stderr, "missing among function scenario for direct trie\n");
+    exit(1);
+}
+
+static void generate_trie_level(struct generator * g,
+                                struct among * x,
+                                const int * cases,
+                                int case_count,
+                                int depth,
+                                bool backwards) {
+    w(g, "~Mif (c_among ");
+    if (backwards) {
+        w(g, "- ");
+        write_int(g, depth);
+        w(g, " > z->lb");
+    } else {
+        w(g, "+ ");
+        write_int(g, depth);
+        w(g, " < z->l");
+    }
+    w(g, ") {~N~+");
+    w(g, "~Mswitch (z->p[c_among ");
+    w(g, backwards ? "- " : "+ ");
+    write_int(g, backwards ? depth + 1 : depth);
+    w(g, "]) {~N~+");
+
+    bool seen[256] = { false };
+    for (int i = 0; i < case_count; ++i) {
+        const struct amongvec * e = x->v + cases[i];
+        if (e->size <= depth) continue;
+        int edge_pos = backwards ? e->size - depth - 1 : depth;
+        unsigned edge = e->b[edge_pos];
+        assert(edge < 256);
+        if (seen[edge]) continue;
+        seen[edge] = true;
+
+        w(g, "~Mcase ");
+        wlitch(g, (int)edge);
+        w(g, ":~N~+");
+
+        int * children = malloc((size_t)case_count * sizeof(*children));
+        if (children == NULL) {
+            fprintf(stderr, "out of memory generating among trie\n");
+            exit(1);
+        }
+        int child_count = 0;
+        int exact = -1;
+        for (int j = 0; j < case_count; ++j) {
+            const struct amongvec * candidate = x->v + cases[j];
+            if (candidate->size <= depth) continue;
+            int candidate_edge_pos =
+                backwards ? candidate->size - depth - 1 : depth;
+            if (candidate->b[candidate_edge_pos] != edge) continue;
+            children[child_count++] = cases[j];
+            if (candidate->size == depth + 1) exact = cases[j];
+        }
+
+        if (exact != -1) {
+            w(g, "~Mamong_var = ");
+            write_int(g, direct_among_case_result(x, exact));
+            w(g, "; z->c = c_among ");
+            w(g, backwards ? "- " : "+ ");
+            write_int(g, depth + 1);
+            w(g, ";~N");
+        }
+
+        bool has_deeper = false;
+        for (int j = 0; j < child_count; ++j) {
+            if (x->v[children[j]].size > depth + 1) {
+                has_deeper = true;
+                break;
+            }
+        }
+        if (has_deeper)
+            generate_trie_level(g, x, children, child_count, depth + 1,
+                                backwards);
+        free(children);
+        w(g, "~Mbreak;~N~-");
+    }
+    w(g, "~-~M}~N");
+    w(g, "~-~M}~N");
+}
+
+static void generate_trie_among(struct generator * g,
+                                struct among * x,
+                                bool backwards) {
+    int case_count;
+    int empty_case;
+    int * cases = collect_direct_among_cases(x, &case_count, &empty_case);
+
+    w(g, "~M{~N~+");
+    w(g, "~Mint c_among = z->c;~N");
+    w(g, "~Mamong_var = ");
+    write_int(g, empty_case == -1 ? 0
+                                  : direct_among_case_result(x, empty_case));
+    w(g, ";~N");
+    generate_trie_level(g, x, cases, case_count, 0, backwards);
+    w(g, "~-~M}~N");
+    free(cases);
+}
+
+/* A bounded radix trie keeps the baseline's compact longest-first leaves but
+ * removes comparisons which are provably shared by a useful-sized group.
+ * There are at most two byte-dispatch levels.  Unary runs are checked by one
+ * constant-size memcmp, and small/low-fanout groups fall back to the same
+ * ordered memcmp shape as DIRECT_AMONG_MEMCMP.  The generated tree is fully
+ * static: it has no node objects, heap storage, or child pointers. */
+#define RADIX_DISPATCH_MIN_CASES 4
+#define RADIX_COMMON_MIN_BYTES 2
+#define RADIX_COMMON_MIN_SAVINGS 4
+#define SHARED_COMMON_MIN_BYTES 3
+#define SHARED_COMMON_MIN_SAVINGS 8
+
+struct bounded_radix_cost {
+    long long dispatch_nodes;
+    long long dispatch_cases;
+    long long comparisons;
+    long long literal_bytes;
+};
+
+static long long bounded_radix_source_cost(
+    const struct bounded_radix_cost * cost) {
+    /* Approximate emitted source, not runtime work.  The coefficients model
+     * the fixed syntax around a bounds/compare leaf and a switch arm; literal
+     * bytes are charged separately.  Only the ratio to the baseline matters. */
+    return cost->dispatch_nodes * 64 + cost->dispatch_cases * 24 +
+           cost->comparisons * 88 + cost->literal_bytes * 3;
+}
+
+static void estimate_bounded_radix_node(const struct among * x,
+                                        const int * cases,
+                                        int case_count,
+                                        int depth,
+                                        int dispatch_levels,
+                                        struct bounded_radix_cost * cost) {
+    int deeper_count = 0;
+    int representative = -1;
+    for (int i = 0; i < case_count; ++i) {
+        if (x->v[cases[i]].size > depth) {
+            ++deeper_count;
+            if (representative == -1) representative = cases[i];
+        }
+    }
+    if (deeper_count == 0) return;
+
+    unsigned edges[256];
+    int edge_count = 0;
+    bool seen[256] = { false };
+    for (int i = 0; i < case_count; ++i) {
+        const struct amongvec * candidate = x->v + cases[i];
+        if (candidate->size <= depth) continue;
+        int pos = among_mode(x) == m_forward
+                      ? depth
+                      : candidate->size - depth - 1;
+        unsigned edge = candidate->b[pos];
+        if (!seen[edge]) {
+            seen[edge] = true;
+            edges[edge_count++] = edge;
+        }
+    }
+
+    bool dispatch = dispatch_levels > 0 && edge_count >= 2 &&
+                    (depth == 0 ||
+                     deeper_count >= RADIX_DISPATCH_MIN_CASES);
+    if (dispatch) {
+        ++cost->dispatch_nodes;
+        cost->dispatch_cases += edge_count;
+        for (int i = 0; i < edge_count; ++i) {
+            int * children = malloc((size_t)case_count * sizeof(*children));
+            if (children == NULL) {
+                fprintf(stderr, "out of memory estimating bounded radix among\n");
+                exit(1);
+            }
+            int child_count = 0;
+            for (int j = 0; j < case_count; ++j) {
+                const struct amongvec * child = x->v + cases[j];
+                if (child->size <= depth) continue;
+                int pos = among_mode(x) == m_forward
+                              ? depth
+                              : child->size - depth - 1;
+                if (child->b[pos] == edges[i])
+                    children[child_count++] = cases[j];
+            }
+            estimate_bounded_radix_node(x, children, child_count, depth + 1,
+                                        dispatch_levels - 1, cost);
+            free(children);
+        }
+        return;
+    }
+
+    int common = 0;
+    while (true) {
+        int expected = -1;
+        bool same = true;
+        for (int i = 0; i < case_count; ++i) {
+            const struct amongvec * candidate = x->v + cases[i];
+            if (candidate->size <= depth) continue;
+            if (candidate->size <= depth + common) {
+                same = false;
+                break;
+            }
+            int pos = among_mode(x) == m_forward
+                          ? depth + common
+                          : candidate->size - depth - common - 1;
+            if (expected == -1) expected = candidate->b[pos];
+            if (candidate->b[pos] != expected) {
+                same = false;
+                break;
+            }
+        }
+        if (!same) break;
+        ++common;
+    }
+
+    if (common >= RADIX_COMMON_MIN_BYTES &&
+        (deeper_count - 1) * common >= RADIX_COMMON_MIN_SAVINGS) {
+        ++cost->comparisons;
+        cost->literal_bytes += common;
+        estimate_bounded_radix_node(x, cases, case_count, depth + common,
+                                    dispatch_levels, cost);
+        return;
+    }
+
+    for (int i = 0; i < case_count; ++i) {
+        const struct amongvec * candidate = x->v + cases[i];
+        if (candidate->size <= depth) continue;
+        ++cost->comparisons;
+        cost->literal_bytes += candidate->size - depth;
+    }
+    (void)representative;
+}
+
+static int get_radix_budget_percent(void) {
+    const char * value = getenv("SNOWBALL_RADIX_BUDGET_PERCENT");
+    if (value == NULL) return 25;
+    char * end = NULL;
+    long budget = strtol(value, &end, 10);
+    if (*value != '\0' && *end == '\0' && budget >= 0 && budget <= 400)
+        return (int)budget;
+    fprintf(stderr, "invalid SNOWBALL_RADIX_BUDGET_PERCENT value: %s\n",
+            value);
+    exit(1);
+}
+
+static bool radix_table_within_budget(const struct among * x) {
+    /* The baseline keeps predicate-bearing tables in the compact runtime
+     * matcher.  Comparing their direct radix expansion against a synthetic
+     * memcmp chain drastically underestimates real source growth (large Hindi,
+     * Polish, and Lovins tables exposed this).  Keep those tables compact;
+     * a future budget for them needs a separate runtime-matcher cost model. */
+    if (x->function_count != 0) return false;
+
+    int * cases = malloc((size_t)x->literalstring_count * sizeof(*cases));
+    if (cases == NULL) {
+        fprintf(stderr, "out of memory estimating bounded radix among\n");
+        exit(1);
+    }
+    int case_count = 0;
+    for (int i = 0; i < x->literalstring_count; ++i) {
+        if (x->v[i].size != 0) cases[case_count++] = i;
+    }
+
+    struct bounded_radix_cost baseline = { 1, 0, 0, 0 };
+    bool first_edges[256] = { false };
+    for (int i = 0; i < case_count; ++i) {
+        const struct amongvec * candidate = x->v + cases[i];
+        int pos = among_mode(x) == m_forward ? 0 : candidate->size - 1;
+        if (!first_edges[candidate->b[pos]]) {
+            first_edges[candidate->b[pos]] = true;
+            ++baseline.dispatch_cases;
+        }
+        ++baseline.comparisons;
+        baseline.literal_bytes += candidate->size - 1;
+    }
+
+    struct bounded_radix_cost radix = { 0, 0, 0, 0 };
+    estimate_bounded_radix_node(x, cases, case_count, 0, 2, &radix);
+    free(cases);
+
+    long long saved_bytes = baseline.literal_bytes - radix.literal_bytes;
+    long long baseline_source = bounded_radix_source_cost(&baseline);
+    long long radix_source = bounded_radix_source_cost(&radix);
+    int budget = get_radix_budget_percent();
+    bool enough_work = case_count >= RADIX_DISPATCH_MIN_CASES &&
+                       baseline.literal_bytes >= 8 && saved_bytes >= 6 &&
+                       saved_bytes * 100 >= baseline.literal_bytes * 12;
+    bool within_growth = radix_source * 100 <=
+                         baseline_source * (100 + budget);
+    return enough_work && within_growth;
+}
+
+static void generate_bounded_radix_leaf(struct generator * g,
+                                        struct among * x,
+                                        const int * cases,
+                                        int case_count,
+                                        int depth,
+                                        bool backwards) {
+    for (int i = 0; i < case_count; ++i) {
+        const struct amongvec * candidate = x->v + cases[i];
+        if (candidate->size <= depth) continue;
+
+        w(g, "~Mif (!radix_matched && c_among ");
+        w(g, backwards ? "- z->lb >= " : "+ ");
+        write_int(g, candidate->size);
+        if (!backwards) w(g, " <= z->l");
+        w(g, " && __builtin_memcmp(z->p + c_among");
+        if (backwards) {
+            w(g, " - ");
+            write_int(g, candidate->size);
+        } else if (depth != 0) {
+            w(g, " + ");
+            write_int(g, depth);
+        }
+        w(g, ", \"");
+        write_c_string_literal_range(
+            g, candidate->b, backwards ? 0 : depth,
+            backwards ? candidate->size - depth : candidate->size);
+        w(g, "\", ");
+        write_int(g, candidate->size - depth);
+        w(g, ") == 0) { radix_matched = 1; among_var = ");
+        write_int(g, direct_among_case_result(x, cases[i]));
+        w(g, "; z->c = c_among ");
+        w(g, backwards ? "- " : "+ ");
+        write_int(g, candidate->size);
+        w(g, "; }~N");
+    }
+}
+
+static void generate_bounded_radix_node(struct generator * g,
+                                        struct among * x,
+                                        const int * cases,
+                                        int case_count,
+                                        int depth,
+                                        int dispatch_levels,
+                                        bool conservative,
+                                        bool backwards) {
+    int exact = -1;
+    int deeper_count = 0;
+    int representative = -1;
+    for (int i = 0; i < case_count; ++i) {
+        const struct amongvec * candidate = x->v + cases[i];
+        if (candidate->size == depth) exact = cases[i];
+        if (candidate->size > depth) {
+            ++deeper_count;
+            if (representative == -1) representative = cases[i];
+        }
+    }
+
+    if (exact != -1) {
+        w(g, "~Mamong_var = ");
+        write_int(g, direct_among_case_result(x, exact));
+        w(g, "; z->c = c_among ");
+        w(g, backwards ? "- " : "+ ");
+        write_int(g, depth);
+        w(g, ";~N");
+    }
+    if (deeper_count == 0) return;
+
+    unsigned edges[256];
+    int edge_count = 0;
+    bool seen[256] = { false };
+    for (int i = 0; i < case_count; ++i) {
+        const struct amongvec * candidate = x->v + cases[i];
+        if (candidate->size <= depth) continue;
+        int pos = backwards ? candidate->size - depth - 1 : depth;
+        unsigned edge = candidate->b[pos];
+        assert(edge < 256);
+        if (!seen[edge]) {
+            seen[edge] = true;
+            edges[edge_count++] = edge;
+        }
+    }
+
+    bool dispatch = dispatch_levels > 0 && edge_count >= 2 &&
+                    (depth == 0 ||
+                     deeper_count >= RADIX_DISPATCH_MIN_CASES);
+    if (dispatch) {
+        w(g, "~Mif (c_among ");
+        if (backwards) {
+            w(g, "- ");
+            write_int(g, depth);
+            w(g, " > z->lb");
+        } else {
+            w(g, "+ ");
+            write_int(g, depth);
+            w(g, " < z->l");
+        }
+        w(g, ") {~N~+");
+        w(g, "~Mswitch (z->p[c_among ");
+        w(g, backwards ? "- " : "+ ");
+        write_int(g, backwards ? depth + 1 : depth);
+        w(g, "]) {~N~+");
+
+        for (int i = 0; i < edge_count; ++i) {
+            int * children = malloc((size_t)case_count * sizeof(*children));
+            if (children == NULL) {
+                fprintf(stderr, "out of memory generating bounded radix among\n");
+                exit(1);
+            }
+            int child_count = 0;
+            for (int j = 0; j < case_count; ++j) {
+                const struct amongvec * child = x->v + cases[j];
+                if (child->size <= depth) continue;
+                int pos = backwards ? child->size - depth - 1 : depth;
+                if (child->b[pos] == edges[i])
+                    children[child_count++] = cases[j];
+            }
+            w(g, "~Mcase ");
+            wlitch(g, (int)edges[i]);
+            w(g, ":~N~+");
+            generate_bounded_radix_node(g, x, children, child_count,
+                                        depth + 1, dispatch_levels - 1,
+                                        conservative, backwards);
+            w(g, "~Mbreak;~N~-");
+            free(children);
+        }
+        w(g, "~-~M}~N");
+        w(g, "~-~M}~N");
+        return;
+    }
+
+    int common = 0;
+    while (true) {
+        int expected = -1;
+        bool same = true;
+        for (int i = 0; i < case_count; ++i) {
+            const struct amongvec * candidate = x->v + cases[i];
+            if (candidate->size <= depth) continue;
+            if (candidate->size <= depth + common) {
+                same = false;
+                break;
+            }
+            int pos = backwards ? candidate->size - depth - common - 1
+                                : depth + common;
+            if (expected == -1) expected = candidate->b[pos];
+            if (candidate->b[pos] != expected) {
+                same = false;
+                break;
+            }
+        }
+        if (!same) break;
+        ++common;
+    }
+
+    int min_common = conservative ? SHARED_COMMON_MIN_BYTES
+                                  : RADIX_COMMON_MIN_BYTES;
+    int min_savings = conservative ? SHARED_COMMON_MIN_SAVINGS
+                                   : RADIX_COMMON_MIN_SAVINGS;
+    if (common >= min_common &&
+        (deeper_count - 1) * common >= min_savings) {
+        const struct amongvec * sample = x->v + representative;
+        w(g, "~Mif (");
+        if (backwards) {
+            w(g, "c_among - ");
+            write_int(g, depth + common);
+            w(g, " >= z->lb && __builtin_memcmp(z->p + c_among - ");
+            write_int(g, depth + common);
+            w(g, ", \"");
+            write_c_string_literal_range(g, sample->b,
+                                         sample->size - depth - common,
+                                         sample->size - depth);
+        } else {
+            w(g, "c_among + ");
+            write_int(g, depth + common);
+            w(g, " <= z->l && __builtin_memcmp(z->p + c_among + ");
+            write_int(g, depth);
+            w(g, ", \"");
+            write_c_string_literal_range(g, sample->b, depth,
+                                         depth + common);
+        }
+        w(g, "\", ");
+        write_int(g, common);
+        w(g, ") == 0) {~N~+");
+        generate_bounded_radix_node(g, x, cases, case_count,
+                                    depth + common, dispatch_levels,
+                                    conservative, backwards);
+        w(g, "~-~M}~N");
+        return;
+    }
+
+    generate_bounded_radix_leaf(g, x, cases, case_count, depth, backwards);
+}
+
+static void generate_bounded_radix_among(struct generator * g,
+                                         struct among * x,
+                                         bool backwards,
+                                         bool conservative) {
+    int case_count;
+    int empty_case;
+    int * cases = collect_direct_among_cases(x, &case_count, &empty_case);
+    sort_direct_among_cases(x, cases, case_count);
+
+    w(g, "~M{~N~+");
+    w(g, "~Mint c_among = z->c;~N");
+    w(g, "~Mint radix_matched = 0;~N");
+    w(g, "~Mamong_var = ");
+    write_int(g, empty_case == -1 ? 0
+                                  : direct_among_case_result(x, empty_case));
+    w(g, ";~N");
+    generate_bounded_radix_node(g, x, cases, case_count, 0,
+                                conservative ? 1 : 2,
+                                conservative, backwards);
+    w(g, "~-~M}~N");
+    free(cases);
+}
+
+/* Emit a static ART specialised for one immutable among table.  Like ART we
+ * compress unary paths and adapt dispatch to the fanout: Node4 performs a few
+ * scalar comparisons, Node16 compares all partial keys in one SIMD operation,
+ * and wider nodes use a byte switch which compilers lower to a jump table.
+ * Generated stemmers do not need mutable heap nodes or child pointers. */
+static void generate_art_node(struct generator * g,
+                              struct among * x,
+                              const int * cases,
+                              int case_count,
+                              int depth,
+                              bool backwards) {
+    int exact = -1;
+    int deeper_count = 0;
+    for (int i = 0; i < case_count; ++i) {
+        const struct amongvec * candidate = x->v + cases[i];
+        if (candidate->size == depth) exact = cases[i];
+        if (candidate->size > depth) ++deeper_count;
+    }
+
+    if (exact != -1) {
+        w(g, "~Mamong_var = ");
+        write_int(g, direct_among_case_result(x, exact));
+        w(g, "; z->c = c_among ");
+        w(g, backwards ? "- " : "+ ");
+        write_int(g, depth);
+        w(g, ";~N");
+    }
+    if (deeper_count == 0) return;
+
+    int representative = -1;
+    for (int i = 0; i < case_count; ++i) {
+        if (x->v[cases[i]].size > depth) {
+            representative = cases[i];
+            break;
+        }
+    }
+    assert(representative != -1);
+
+    int run = 0;
+    while (true) {
+        int expected = -1;
+        bool common = true;
+        for (int i = 0; i < case_count; ++i) {
+            const struct amongvec * candidate = x->v + cases[i];
+            if (candidate->size <= depth) continue;
+            if (candidate->size <= depth + run) {
+                common = false;
+                break;
+            }
+            int pos = backwards ? candidate->size - depth - run - 1
+                                : depth + run;
+            int ch = candidate->b[pos];
+            if (expected == -1) expected = ch;
+            if (ch != expected) {
+                common = false;
+                break;
+            }
+        }
+        if (!common) break;
+        ++run;
+    }
+
+    if (run != 0) {
+        const struct amongvec * sample = x->v + representative;
+        w(g, "~Mif (");
+        if (backwards) {
+            w(g, "c_among - ");
+            write_int(g, depth + run);
+            w(g, " >= z->lb && __builtin_memcmp(z->p + c_among - ");
+            write_int(g, depth + run);
+            w(g, ", \"");
+            write_c_string_literal_range(g, sample->b,
+                                         sample->size - depth - run,
+                                         sample->size - depth);
+        } else {
+            w(g, "c_among + ");
+            write_int(g, depth + run);
+            w(g, " <= z->l && __builtin_memcmp(z->p + c_among + ");
+            write_int(g, depth);
+            w(g, ", \"");
+            write_c_string_literal_range(g, sample->b, depth, depth + run);
+        }
+        w(g, "\", ");
+        write_int(g, run);
+        w(g, ") == 0) {~N~+");
+        generate_art_node(g, x, cases, case_count, depth + run, backwards);
+        w(g, "~-~M}~N");
+        return;
+    }
+
+    w(g, "~Mif (c_among ");
+    if (backwards) {
+        w(g, "- ");
+        write_int(g, depth);
+        w(g, " > z->lb");
+    } else {
+        w(g, "+ ");
+        write_int(g, depth);
+        w(g, " < z->l");
+    }
+    w(g, ") {~N~+");
+
+    unsigned edges[256];
+    int edge_count = 0;
+    bool seen[256] = { false };
+    for (int i = 0; i < case_count; ++i) {
+        const struct amongvec * candidate = x->v + cases[i];
+        if (candidate->size <= depth) continue;
+        int pos = backwards ? candidate->size - depth - 1 : depth;
+        unsigned edge = candidate->b[pos];
+        assert(edge < 256);
+        if (seen[edge]) continue;
+        seen[edge] = true;
+        edges[edge_count++] = edge;
+    }
+
+    bool node4_linear = edge_count <= 4 && get_art_node4_linear();
+    bool node16_simd = edge_count > 4 && edge_count <= 16 &&
+                       get_art_node16_simd();
+    if (node4_linear) {
+        w(g, "~Munsigned char art_key = z->p[c_among ");
+        w(g, backwards ? "- " : "+ ");
+        write_int(g, backwards ? depth + 1 : depth);
+        w(g, "];~N");
+    } else if (node16_simd) {
+        w(g, "~Mstatic const unsigned char art_keys[16] = {");
+        for (int i = 0; i < 16; ++i) {
+            if (i != 0) w(g, ", ");
+            write_int(g, i < edge_count ? (int)edges[i] : 0);
+        }
+        w(g, "};~N");
+        w(g, "~Mint art_child = snowball_art_find16(art_keys, ");
+        write_int(g, edge_count);
+        w(g, ", z->p[c_among ");
+        w(g, backwards ? "- " : "+ ");
+        write_int(g, backwards ? depth + 1 : depth);
+        w(g, "]);~N");
+        w(g, "~Mswitch (art_child) {~N~+");
+    } else {
+        w(g, "~Mswitch (z->p[c_among ");
+        w(g, backwards ? "- " : "+ ");
+        write_int(g, backwards ? depth + 1 : depth);
+        w(g, "]) {~N~+");
+    }
+
+    for (int i = 0; i < edge_count; ++i) {
+        unsigned edge = edges[i];
+
+        int * children = malloc((size_t)case_count * sizeof(*children));
+        if (children == NULL) {
+            fprintf(stderr, "out of memory generating ART among\n");
+            exit(1);
+        }
+        int child_count = 0;
+        for (int j = 0; j < case_count; ++j) {
+            const struct amongvec * child = x->v + cases[j];
+            if (child->size <= depth) continue;
+            int child_pos = backwards ? child->size - depth - 1 : depth;
+            if (child->b[child_pos] == edge) children[child_count++] = cases[j];
+        }
+
+        if (node4_linear) {
+            w(g, i == 0 ? "~Mif (art_key == " : "~Melse if (art_key == ");
+            wlitch(g, (int)edge);
+            w(g, ") {~N~+");
+            generate_art_node(g, x, children, child_count, depth + 1,
+                              backwards);
+            w(g, "~-~M}~N");
+        } else {
+            w(g, "~Mcase ");
+            if (node16_simd)
+                write_int(g, i);
+            else
+                wlitch(g, (int)edge);
+            w(g, ":~N~+");
+            generate_art_node(g, x, children, child_count, depth + 1,
+                              backwards);
+            w(g, "~Mbreak;~N~-");
+        }
+        free(children);
+    }
+    if (!node4_linear) w(g, "~-~M}~N");
+    w(g, "~-~M}~N");
+}
+
+static void generate_art_among(struct generator * g,
+                               struct among * x,
+                               bool backwards) {
+    int case_count;
+    int empty_case;
+    int * cases = collect_direct_among_cases(x, &case_count, &empty_case);
+
+    w(g, "~M{~N~+");
+    w(g, "~Mint c_among = z->c;~N");
+    w(g, "~Mamong_var = ");
+    write_int(g, empty_case == -1 ? 0
+                                  : direct_among_case_result(x, empty_case));
+    w(g, ";~N");
+    generate_art_node(g, x, cases, case_count, 0, backwards);
+    w(g, "~-~M}~N");
+    free(cases);
 }
 
 static void generate_substring(struct generator * g, struct node * p) {
     write_comment(g, p);
 
     struct among * x = p->among;
+
+    struct amongvec * among_cases = x->v;
+    enum direct_among_backend direct_backend =
+        select_direct_among_backend(g, x);
+    bool direct_trie_with_functions =
+        x->function_count != 0 &&
+        (direct_backend == DIRECT_AMONG_TRIE ||
+         direct_backend == DIRECT_AMONG_ART ||
+         direct_backend == DIRECT_AMONG_RADIX ||
+         direct_backend == DIRECT_AMONG_SHARED_PREFIX);
+    bool direct_backend_supported =
+        direct_backend != DIRECT_AMONG_DEFAULT &&
+        direct_backend != DIRECT_AMONG_RUNTIME &&
+        direct_backend != DIRECT_AMONG_AUTO &&
+        !(g->options->target_lang == LANG_C &&
+          (direct_backend == DIRECT_AMONG_PACKED ||
+           direct_backend == DIRECT_AMONG_HYBRID ||
+           direct_backend == DIRECT_AMONG_TWOBYTE_PACKED ||
+           direct_backend == DIRECT_AMONG_ART));
+
+    if ((g->options->target_lang == LANG_CPLUSPLUS ||
+         g->options->target_lang == LANG_C) &&
+        g->options->encoding == ENC_UTF8 &&
+        !g->options->coverage &&
+        direct_backend_supported &&
+        (x->function_count == 0 || direct_trie_with_functions)) {
+        if (direct_trie_with_functions && x->c0_used) {
+            write_block_start(g);
+            w(g, "~Mint c0 = z->c;~N");
+        }
+        switch (direct_backend) {
+            case DIRECT_AMONG_DEFAULT:
+            case DIRECT_AMONG_RUNTIME:
+            case DIRECT_AMONG_AUTO:
+            case DIRECT_AMONG_RADIX_BUDGET:
+                assert(false);
+                break;
+            case DIRECT_AMONG_MEMCMP:
+                generate_memcmp_among(g, x, p->mode != m_forward, false);
+                break;
+            case DIRECT_AMONG_TWOBYTE:
+                generate_twobyte_among(g, x, p->mode != m_forward, false);
+                break;
+            case DIRECT_AMONG_TWOBYTE_PACKED:
+                generate_twobyte_among(g, x, p->mode != m_forward, true);
+                break;
+            case DIRECT_AMONG_HYBRID:
+                generate_memcmp_among(g, x, p->mode != m_forward, true);
+                break;
+            case DIRECT_AMONG_TRIE:
+                generate_trie_among(g, x, p->mode != m_forward);
+                break;
+            case DIRECT_AMONG_ART:
+                generate_art_among(g, x, p->mode != m_forward);
+                break;
+            case DIRECT_AMONG_RADIX:
+                generate_bounded_radix_among(g, x, p->mode != m_forward,
+                                             false);
+                break;
+            case DIRECT_AMONG_SHARED_PREFIX:
+                generate_bounded_radix_among(g, x, p->mode != m_forward,
+                                             true);
+                break;
+            case DIRECT_AMONG_PACKED:
+                generate_packed_among(g, x, p->mode != m_forward);
+                break;
+        }
+        x->used = false;
+        if (direct_trie_with_functions) goto handle_among_function;
+        if (!x->always_matches) writef(g, "~Mif (!among_var) ~f~N", p);
+        return;
+    }
     int block = -1;
     unsigned int bitmap = 0;
-    struct amongvec * among_cases = x->v;
     int empty_case = -1;
     int n_cases = 0;
     symbol cases[2];
@@ -1574,6 +3095,7 @@ static void generate_substring(struct generator * g, struct node * p) {
             w(g, "~Mint c0 = z->c;~N");
         }
         writef(g, "~Mamong_var = find_among~S0(z, a_~I0);~N", p);
+handle_among_function:
         if (x->function_count) {
             // The C/C++ find_among()/find_among_b() helper function doesn't
             // call among functions itself, but instead returns an among
@@ -1961,14 +3483,429 @@ static void generate_head(struct generator * g) {
         w(g, "#include <limits.h>~N");
     }
     w(g, "#include <stddef.h>~N~N");
+    if (o->target_lang == LANG_CPLUSPLUS &&
+        direct_among_backend_is_used(g, DIRECT_AMONG_ART)) {
+        w(g, "#include <bit>~N#include <stdint.h>~N~N");
+    }
     if (g->options->coverage) {
         w(g, "#include <stdio.h>~N");
+    }
+
+    if (o->target_lang == LANG_C) {
+        w(g, "#include \"");
+        if (o->runtime_path) {
+            write_string(g, o->runtime_path);
+            if (o->runtime_path[strlen(o->runtime_path) - 1] != '/')
+                write_char(g, '/');
+        }
+        w(g, "snowball_runtime.h\"~N~N"
+             "typedef struct SN_env SN_env;~N~N");
+
+        if (g->analyser->variable_count > 0) {
+            w(g, "struct SN_local {~N~+"
+                 "~Mstruct SN_env z;~N");
+            for (struct name * name = g->analyser->names; name;
+                 name = name->next) {
+                if (!name->local_to && name->type == t_integer) {
+                    w(g, "~Mint ");
+                    write_varname(g, name);
+                    w(g, ";~N");
+                }
+            }
+            for (struct name * name = g->analyser->names; name;
+                 name = name->next) {
+                if (!name->local_to && name->type == t_boolean) {
+                    w(g, "~Munsigned char ");
+                    write_varname(g, name);
+                    w(g, ";~N");
+                }
+            }
+            for (struct name * name = g->analyser->names; name;
+                 name = name->next) {
+                if (!name->local_to && name->type == t_string) {
+                    w(g, "~Msymbol * ");
+                    write_varname(g, name);
+                    w(g, ";~N");
+                }
+            }
+            w(g, "~-~M};~N~N"
+                 "typedef struct SN_local SN_local;~N~N");
+        }
     }
 
     if (o->target_lang == LANG_CPLUSPLUS) {
         w(g, "~Mtypedef ");
         write_string(g, o->package);
         w(g, "::~n::SN_local SN_local;~N~N");
+    }
+
+    if (o->target_lang == LANG_CPLUSPLUS || o->target_lang == LANG_C) {
+        int runtime_fast_path = get_runtime_fast_path();
+        bool assume_ascii = runtime_fast_path & RUNTIME_FAST_ASSUME_ASCII;
+        bool fixed2_utf8 = runtime_fast_path & RUNTIME_FAST_FIXED2_UTF8;
+        bool fixed3_utf8 = runtime_fast_path & RUNTIME_FAST_FIXED3_UTF8;
+        bool inline_two_byte_utf8 = !assume_ascii && !fixed2_utf8 &&
+                                    !fixed3_utf8 && get_inline_two_byte_utf8();
+        w(g, "~M#if defined(__GNUC__) || defined(__clang__)~N"
+             "~M#define SNOWBALL_UNUSED __attribute__((unused))~N"
+             "~M#else~N"
+             "~M#define SNOWBALL_UNUSED~N"
+             "~M#endif~N~N");
+        if (runtime_fast_path & RUNTIME_FAST_GROUPING) {
+            if (inline_two_byte_utf8) {
+                w(g, "~Mstatic inline SNOWBALL_UNUSED int snowball_decode_two_byte_utf8("
+                     "const symbol * p, int c, int limit, int * ch) {~N~+"
+                     "~Mif (c + 1 >= limit) return 0;~N"
+                     "~Mint lead = p[c];~N"
+                     "~Mint tail = p[c + 1];~N"
+                     "~Mif (lead < 0xC2 || lead > 0xDF || "
+                     "(tail & 0xC0) != 0x80) return 0;~N"
+                     "~M*ch = ((lead & 0x1F) << 6) | (tail & 0x3F);~N"
+                     "~Mreturn 2;~N"
+                     "~-~M}~N~N"
+                     "~Mstatic inline SNOWBALL_UNUSED int snowball_decode_two_byte_b_utf8("
+                     "const symbol * p, int c, int limit, int * ch) {~N~+"
+                     "~Mif (c - limit < 2) return 0;~N"
+                     "~Mint lead = p[c - 2];~N"
+                     "~Mint tail = p[c - 1];~N"
+                     "~Mif (lead < 0xC2 || lead > 0xDF || "
+                     "(tail & 0xC0) != 0x80) return 0;~N"
+                     "~M*ch = ((lead & 0x1F) << 6) | (tail & 0x3F);~N"
+                     "~Mreturn 2;~N"
+                     "~-~M}~N~N");
+            }
+            w(g, "~Mstatic inline SNOWBALL_UNUSED int snowball_grouping_contains("
+                 "const unsigned char * s, int min, int max, int ch) {~N~+"
+                 "~Mreturn ch >= min && ch <= max &&~N"
+                 "~M       (s[(ch - min) >> 3] & "
+                 "(1u << ((ch - min) & 7))) != 0;~N"
+                 "~-~M}~N~N"
+                 "~Mstatic inline SNOWBALL_UNUSED int snowball_in_grouping_U("
+                 "SN_env * z, const unsigned char * s, int min, int max, "
+                 "int repeat) {~N~+"
+                 "~Mdo {~N~+"
+                 "~Mif (z->c >= z->l) return -1;~N"
+                 "~Mint ch = z->p[z->c];~N");
+            if (fixed2_utf8) {
+                w(g, "~Mint width = 1;~N"
+                     "~Mif (ch >= 0x80) {~N~+"
+                     "~Mif (z->c + 1 >= z->l) return in_grouping_U(z, s, min, max, repeat);~N"
+                     "~Mch = ((ch & 0x1F) << 6) | (z->p[z->c + 1] & 0x3F);~N"
+                     "~Mwidth = 2;~N"
+                     "~-~M}~N");
+            } else if (fixed3_utf8) {
+                w(g, "~Mint width = 1;~N"
+                     "~Mif (ch >= 0x80) {~N~+"
+                     "~Mif (z->c + 2 >= z->l) return in_grouping_U(z, s, min, max, repeat);~N"
+                     "~Mch = ((ch & 0x0F) << 12) | "
+                     "((z->p[z->c + 1] & 0x3F) << 6) | "
+                     "(z->p[z->c + 2] & 0x3F);~N"
+                     "~Mwidth = 3;~N"
+                     "~-~M}~N");
+            } else if (inline_two_byte_utf8) {
+                w(g, "~Mint width = 1;~N"
+                     "~Mif (ch >= 0x80) {~N~+"
+                     "~Mwidth = snowball_decode_two_byte_utf8("
+                     "z->p, z->c, z->l, &ch);~N"
+                     "~Mif (!width) return in_grouping_U(z, s, min, max, repeat);~N"
+                     "~-~M}~N");
+            } else {
+                if (!assume_ascii) {
+                    w(g, "~Mif (ch >= 0x80) return in_grouping_U(z, s, min, max, repeat);~N");
+                }
+                w(g, "~Mint width = 1;~N");
+            }
+            w(g,
+                 "~Mif (!snowball_grouping_contains(s, min, max, ch)) return width;~N"
+                 "~Mz->c += width;~N"
+                 "~-~M} while (repeat);~N"
+                 "~Mreturn 0;~N"
+                 "~-~M}~N~N"
+                 "~Mstatic inline SNOWBALL_UNUSED int snowball_in_grouping_b_U("
+                 "SN_env * z, const unsigned char * s, int min, int max, "
+                 "int repeat) {~N~+"
+                 "~Mdo {~N~+"
+                 "~Mif (z->c <= z->lb) return -1;~N"
+                 "~Mint ch = z->p[z->c - 1];~N");
+            if (fixed2_utf8) {
+                w(g, "~Mint width = 1;~N"
+                     "~Mif (ch >= 0x80) {~N~+"
+                     "~Mif (z->c - z->lb < 2) return in_grouping_b_U(z, s, min, max, repeat);~N"
+                     "~Mint lead = z->p[z->c - 2];~N"
+                     "~Mch = ((lead & 0x1F) << 6) | (ch & 0x3F);~N"
+                     "~Mwidth = 2;~N"
+                     "~-~M}~N");
+            } else if (fixed3_utf8) {
+                w(g, "~Mint width = 1;~N"
+                     "~Mif (ch >= 0x80) {~N~+"
+                     "~Mif (z->c - z->lb < 3) return in_grouping_b_U(z, s, min, max, repeat);~N"
+                     "~Mint lead = z->p[z->c - 3];~N"
+                     "~Mch = ((lead & 0x0F) << 12) | "
+                     "((z->p[z->c - 2] & 0x3F) << 6) | (ch & 0x3F);~N"
+                     "~Mwidth = 3;~N"
+                     "~-~M}~N");
+            } else if (inline_two_byte_utf8) {
+                w(g, "~Mint width = 1;~N"
+                     "~Mif (ch >= 0x80) {~N~+"
+                     "~Mwidth = snowball_decode_two_byte_b_utf8("
+                     "z->p, z->c, z->lb, &ch);~N"
+                     "~Mif (!width) return in_grouping_b_U(z, s, min, max, repeat);~N"
+                     "~-~M}~N");
+            } else {
+                if (!assume_ascii) {
+                    w(g, "~Mif (ch >= 0x80) return in_grouping_b_U(z, s, min, max, repeat);~N");
+                }
+                w(g, "~Mint width = 1;~N");
+            }
+            w(g,
+                 "~Mif (!snowball_grouping_contains(s, min, max, ch)) return width;~N"
+                 "~Mz->c -= width;~N"
+                 "~-~M} while (repeat);~N"
+                 "~Mreturn 0;~N"
+                 "~-~M}~N~N"
+                 "~Mstatic inline SNOWBALL_UNUSED int snowball_out_grouping_U("
+                 "SN_env * z, const unsigned char * s, int min, int max, "
+                 "int repeat) {~N~+"
+                 "~Mdo {~N~+"
+                 "~Mif (z->c >= z->l) return -1;~N"
+                 "~Mint ch = z->p[z->c];~N");
+            if (fixed2_utf8) {
+                w(g, "~Mint width = 1;~N"
+                     "~Mif (ch >= 0x80) {~N~+"
+                     "~Mif (z->c + 1 >= z->l) return out_grouping_U(z, s, min, max, repeat);~N"
+                     "~Mch = ((ch & 0x1F) << 6) | (z->p[z->c + 1] & 0x3F);~N"
+                     "~Mwidth = 2;~N"
+                     "~-~M}~N");
+            } else if (fixed3_utf8) {
+                w(g, "~Mint width = 1;~N"
+                     "~Mif (ch >= 0x80) {~N~+"
+                     "~Mif (z->c + 2 >= z->l) return out_grouping_U(z, s, min, max, repeat);~N"
+                     "~Mch = ((ch & 0x0F) << 12) | "
+                     "((z->p[z->c + 1] & 0x3F) << 6) | "
+                     "(z->p[z->c + 2] & 0x3F);~N"
+                     "~Mwidth = 3;~N"
+                     "~-~M}~N");
+            } else if (inline_two_byte_utf8) {
+                w(g, "~Mint width = 1;~N"
+                     "~Mif (ch >= 0x80) {~N~+"
+                     "~Mwidth = snowball_decode_two_byte_utf8("
+                     "z->p, z->c, z->l, &ch);~N"
+                     "~Mif (!width) return out_grouping_U(z, s, min, max, repeat);~N"
+                     "~-~M}~N");
+            } else {
+                if (!assume_ascii) {
+                    w(g, "~Mif (ch >= 0x80) return out_grouping_U(z, s, min, max, repeat);~N");
+                }
+                w(g, "~Mint width = 1;~N");
+            }
+            w(g,
+                 "~Mif (snowball_grouping_contains(s, min, max, ch)) return width;~N"
+                 "~Mz->c += width;~N"
+                 "~-~M} while (repeat);~N"
+                 "~Mreturn 0;~N"
+                 "~-~M}~N~N"
+                 "~Mstatic inline SNOWBALL_UNUSED int snowball_out_grouping_b_U("
+                 "SN_env * z, const unsigned char * s, int min, int max, "
+                 "int repeat) {~N~+"
+                 "~Mdo {~N~+"
+                 "~Mif (z->c <= z->lb) return -1;~N"
+                 "~Mint ch = z->p[z->c - 1];~N");
+            if (fixed2_utf8) {
+                w(g, "~Mint width = 1;~N"
+                     "~Mif (ch >= 0x80) {~N~+"
+                     "~Mif (z->c - z->lb < 2) return out_grouping_b_U(z, s, min, max, repeat);~N"
+                     "~Mint lead = z->p[z->c - 2];~N"
+                     "~Mch = ((lead & 0x1F) << 6) | (ch & 0x3F);~N"
+                     "~Mwidth = 2;~N"
+                     "~-~M}~N");
+            } else if (fixed3_utf8) {
+                w(g, "~Mint width = 1;~N"
+                     "~Mif (ch >= 0x80) {~N~+"
+                     "~Mif (z->c - z->lb < 3) return out_grouping_b_U(z, s, min, max, repeat);~N"
+                     "~Mint lead = z->p[z->c - 3];~N"
+                     "~Mch = ((lead & 0x0F) << 12) | "
+                     "((z->p[z->c - 2] & 0x3F) << 6) | (ch & 0x3F);~N"
+                     "~Mwidth = 3;~N"
+                     "~-~M}~N");
+            } else if (inline_two_byte_utf8) {
+                w(g, "~Mint width = 1;~N"
+                     "~Mif (ch >= 0x80) {~N~+"
+                     "~Mwidth = snowball_decode_two_byte_b_utf8("
+                     "z->p, z->c, z->lb, &ch);~N"
+                     "~Mif (!width) return out_grouping_b_U(z, s, min, max, repeat);~N"
+                     "~-~M}~N");
+            } else {
+                if (!assume_ascii) {
+                    w(g, "~Mif (ch >= 0x80) return out_grouping_b_U(z, s, min, max, repeat);~N");
+                }
+                w(g, "~Mint width = 1;~N");
+            }
+            w(g,
+                 "~Mif (snowball_grouping_contains(s, min, max, ch)) return width;~N"
+                 "~Mz->c -= width;~N"
+                 "~-~M} while (repeat);~N"
+                 "~Mreturn 0;~N"
+                 "~-~M}~N~N");
+        }
+
+        if ((runtime_fast_path & RUNTIME_FAST_SKIP) && !assume_ascii) {
+            if (fixed2_utf8 || fixed3_utf8) {
+                g->I[0] = fixed2_utf8 ? 2 : 3;
+                w(g, "~Mstatic inline SNOWBALL_UNUSED int snowball_skip_utf8("
+                     "const symbol * p, int c, int limit, int n) {~N~+"
+                     "~Mfor (; n > 0; --n) {~N~+"
+                     "~Mif (c >= limit) return -1;~N"
+                     "~Mc += p[c] < 0x80 ? 1 : ~I0;~N"
+                     "~Mif (c > limit) return -1;~N"
+                     "~-~M}~N"
+                     "~Mreturn c;~N"
+                     "~-~M}~N~N"
+                     "~Mstatic inline SNOWBALL_UNUSED int snowball_skip_b_utf8("
+                     "const symbol * p, int c, int limit, int n) {~N~+"
+                     "~Mfor (; n > 0; --n) {~N~+"
+                     "~Mif (c <= limit) return -1;~N"
+                     "~Mc -= p[c - 1] < 0x80 ? 1 : ~I0;~N"
+                     "~Mif (c < limit) return -1;~N"
+                     "~-~M}~N"
+                     "~Mreturn c;~N"
+                     "~-~M}~N~N");
+            } else {
+                w(g, "~Mstatic inline SNOWBALL_UNUSED int snowball_skip_utf8("
+                 "const symbol * p, int c, int limit, int n) {~N~+");
+                if (get_fast_single_skip()) {
+                    w(g, "~Mif (n == 1) {~N~+"
+                         "~Mif (c >= limit) return -1;~N"
+                         "~Mint lead = p[c];~N"
+                         "~Mif (lead < 0x80) return c + 1;~N"
+                         "~Mif (lead >= 0xC2 && lead <= 0xDF && c + 1 < limit && "
+                         "(p[c + 1] & 0xC0) == 0x80) return c + 2;~N"
+                         "~Mif (lead >= 0xE0 && lead <= 0xEF && c + 2 < limit && "
+                         "(p[c + 1] & 0xC0) == 0x80 && "
+                         "(p[c + 2] & 0xC0) == 0x80 && "
+                         "(lead != 0xE0 || p[c + 1] >= 0xA0) && "
+                         "(lead != 0xED || p[c + 1] < 0xA0)) return c + 3;~N"
+                         "~Mif (lead >= 0xF0 && lead <= 0xF4 && c + 3 < limit && "
+                         "(p[c + 1] & 0xC0) == 0x80 && "
+                         "(p[c + 2] & 0xC0) == 0x80 && "
+                         "(p[c + 3] & 0xC0) == 0x80 && "
+                         "(lead != 0xF0 || p[c + 1] >= 0x90) && "
+                         "(lead != 0xF4 || p[c + 1] < 0x90)) return c + 4;~N"
+                         "~Mreturn skip_utf8(p, c, limit, 1);~N"
+                         "~-~M}~N");
+                }
+                w(g,
+                 "~Mfor (; n > 0; --n) {~N~+"
+                 "~Mif (c >= limit) return -1;~N"
+                 "~Mint b = p[c++];~N"
+                 "~Mif (b >= 0xC0) {~N~+"
+                 "~Mwhile (c < limit && p[c] >= 0x80 && p[c] < 0xC0) ++c;~N"
+                 "~-~M}~N"
+                 "~-~M}~N"
+                 "~Mreturn c;~N"
+                 "~-~M}~N~N"
+                 "~Mstatic inline SNOWBALL_UNUSED int snowball_skip_b_utf8("
+                 "const symbol * p, int c, int limit, int n) {~N~+");
+                if (get_fast_single_skip()) {
+                    w(g, "~Mif (n == 1) {~N~+"
+                         "~Mif (c <= limit) return -1;~N"
+                         "~Mint tail = p[c - 1];~N"
+                         "~Mif (tail < 0x80) return c - 1;~N"
+                         "~Mif ((tail & 0xC0) == 0x80 && c - limit >= 4) {~N~+"
+                         "~Mint lead = p[c - 4];~N"
+                         "~Mif (lead >= 0xF0 && lead <= 0xF4 && "
+                         "(p[c - 3] & 0xC0) == 0x80 && "
+                         "(p[c - 2] & 0xC0) == 0x80 && "
+                         "(lead != 0xF0 || p[c - 3] >= 0x90) && "
+                         "(lead != 0xF4 || p[c - 3] < 0x90)) return c - 4;~N"
+                         "~-~M}~N"
+                         "~Mif ((tail & 0xC0) == 0x80 && c - limit >= 3) {~N~+"
+                         "~Mint lead = p[c - 3];~N"
+                         "~Mif (lead >= 0xE0 && lead <= 0xEF && "
+                         "(p[c - 2] & 0xC0) == 0x80 && "
+                         "(lead != 0xE0 || p[c - 2] >= 0xA0) && "
+                         "(lead != 0xED || p[c - 2] < 0xA0)) return c - 3;~N"
+                         "~-~M}~N"
+                         "~Mif ((tail & 0xC0) == 0x80 && c - limit >= 2) {~N~+"
+                         "~Mint lead = p[c - 2];~N"
+                         "~Mif (lead >= 0xC2 && lead <= 0xDF) return c - 2;~N"
+                         "~-~M}~N"
+                         "~Mreturn skip_b_utf8(p, c, limit, 1);~N"
+                         "~-~M}~N");
+                }
+                w(g,
+                 "~Mfor (; n > 0; --n) {~N~+"
+                 "~Mif (c <= limit) return -1;~N"
+                 "~Mint b = p[--c];~N"
+                 "~Mif (b >= 0x80) {~N~+"
+                 "~Mwhile (c > limit && p[c] < 0xC0) --c;~N"
+                 "~-~M}~N"
+                 "~-~M}~N"
+                 "~Mreturn c;~N"
+                 "~-~M}~N~N");
+            }
+        }
+
+        if (get_fast_suffix_delete()) {
+            w(g, "~Mstatic inline SNOWBALL_UNUSED int snowball_slice_del(SN_env * z) {~N~+"
+                 "~Mif (z->bra >= 0 && z->bra <= z->ket && "
+                 "z->ket == z->l && z->l <= SIZE(z->p)) {~N~+"
+                 "~MSET_SIZE(z->p, z->bra);~N"
+                 "~Mz->l = z->bra;~N"
+                 "~Mif (z->c > z->bra) z->c = z->bra;~N"
+                 "~Mz->ket = z->bra;~N"
+                 "~Mreturn 0;~N"
+                 "~-~M}~N");
+            if (o->target_lang == LANG_CPLUSPLUS) {
+                w(g, "~Mslice_del(z);~N~Mreturn 0;~N");
+            } else {
+                w(g, "~Mreturn slice_del(z);~N");
+            }
+            w(g, "~-~M}~N~N");
+        }
+
+        if (o->target_lang == LANG_CPLUSPLUS &&
+            (get_direct_among_backend() == DIRECT_AMONG_PACKED ||
+             get_direct_among_backend() == DIRECT_AMONG_HYBRID ||
+             get_direct_among_backend() == DIRECT_AMONG_TWOBYTE_PACKED)) {
+            w(g, "~Mtemplate <size_t N>~N"
+                 "~Mstatic inline bool snowball_packed_equal("
+                 "const symbol * input, const char (&literal)[N]) {~N~+"
+                 "~Mstatic_assert(N >= 2 && N <= 9, "
+                 "\"packed comparison must contain 1..8 bytes\");~N"
+                 "~Munsigned long long left = 0;~N"
+                 "~Munsigned long long right = 0;~N"
+                 "~M__builtin_memcpy(&left, input, N - 1);~N"
+                 "~M__builtin_memcpy(&right, literal, N - 1);~N"
+                 "~Mreturn left == right;~N"
+                 "~-~M}~N~N");
+        }
+
+        if (o->target_lang == LANG_CPLUSPLUS &&
+            direct_among_backend_is_used(g, DIRECT_AMONG_ART)) {
+            w(g, "~Musing snowball_art_u8x16 = "
+                 "unsigned char __attribute__((vector_size(16)));~N"
+                 "~Musing snowball_art_i8x16 = "
+                 "signed char __attribute__((vector_size(16)));~N"
+                 "~Musing snowball_art_b8x16 = "
+                 "bool __attribute__((ext_vector_type(16)));~N"
+                 "~Mstatic inline SNOWBALL_UNUSED int snowball_art_find16("
+                 "const unsigned char * keys, int count, "
+                 "unsigned char key) {~N~+"
+                 "~Msnowball_art_u8x16 stored;~N"
+                 "~M__builtin_memcpy(&stored, keys, 16);~N"
+                 "~Msnowball_art_u8x16 wanted = {"
+                 "key, key, key, key, key, key, key, key, "
+                 "key, key, key, key, key, key, key, key};~N"
+                 "~Msnowball_art_i8x16 compared = "
+                 "(snowball_art_i8x16)(stored == wanted);~N"
+                 "~Muint16_t mask = std::bit_cast<uint16_t>("
+                 "__builtin_convertvector(compared, snowball_art_b8x16));~N"
+                 "~Mmask &= (uint16_t)((1u << count) - 1u);~N"
+                 "~Mreturn mask ? __builtin_ctz((unsigned)mask) : 16;~N"
+                 "~-~M}~N~N");
+        }
+
+        w(g, "~M#undef SNOWBALL_UNUSED~N~N");
 
         if (g->analyser->amongs && !wide) {
             w(g, "~M#ifdef SNOWBALL_BIGENDIAN~N");
@@ -2858,7 +4795,8 @@ static void generate_header_file(struct generator * g) {
             if (o->runtime_path[strlen(o->runtime_path) - 1] != '/')
                 write_char(g, '/');
         }
-        w(g, "snowball_runtime.h\"~N~N");
+        w(g, "snowball_runtime.h\"~N"
+             "#include <string_view>~N~N");
 
         w(g, "namespace ");
         write_string(g, o->package);
@@ -3061,20 +4999,32 @@ static void generate_header_file(struct generator * g) {
         if (o->encoding == ENC_WIDECHARS) {
             g->S[0] = "std::wstring";
             g->S[1] = "wchar_t";
+            g->S[2] = "std::wstring_view";
         } else {
             g->S[0] = "std::string";
             g->S[1] = "char";
+            g->S[2] = "std::string_view";
         }
         w(g, "~-~M}~N~N"
              "~M~~~n() {~N~+"
              "~Mclose_env();~N"
              "~-~M}~N~N"
-             "~M~S0 operator()(const ~S0& word) override {~N~+"
+             "~M~S2 stem_view(~S2 word) {~N~+"
              "~Mstruct SN_env* z = &(zlocal.z);~N"
              "~Mconst symbol* s = reinterpret_cast<const symbol*>(word.data());~N"
-             "~Mint s_size = word.size() > INT_MAX ? INT_MAX : static_cast<int>(word.size());~N"
-             "~Mreplace_s(z, 0, z->l, s_size, s);~N"
-             "~Mz->c = 0;~N"
+             "~Mint s_size = word.size() > INT_MAX ? INT_MAX : static_cast<int>(word.size());~N");
+        if (get_fast_input_copy()) {
+            w(g, "~Mif (s_size > CAPACITY(z->p)) {~N~+"
+                 "~Mreplace_s(z, 0, z->l, s_size, s);~N"
+                 "~-~M} else {~N~+"
+                 "~Mif (s_size) __builtin_memcpy(z->p, s, s_size);~N"
+                 "~MSET_SIZE(z->p, s_size);~N"
+                 "~Mz->l = s_size;~N"
+                 "~-~M}~N");
+        } else {
+            w(g, "~Mreplace_s(z, 0, z->l, s_size, s);~N");
+        }
+        w(g, "~Mz->c = 0;~N"
              "~M");
         write_string(g, o->package);
         write_string(g, "::");
@@ -3084,7 +5034,10 @@ static void generate_header_file(struct generator * g) {
             write_string(g, o->externals_prefix);
         }
         w(g, "stem(z);~N"
-             "~Mreturn ~S0(reinterpret_cast<const ~S1*>(z->p), SIZE(z->p));~N"
+             "~Mreturn ~S2(reinterpret_cast<const ~S1*>(z->p), SIZE(z->p));~N"
+             "~-~M}~N~N"
+             "~M~S0 operator()(const ~S0& word) override {~N~+"
+             "~Mreturn ~S0(stem_view(word));~N"
              "~-~M}~N"
              "~-~M};~N~N");
 
